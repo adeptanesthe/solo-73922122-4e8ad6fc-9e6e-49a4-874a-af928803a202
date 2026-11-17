@@ -55,6 +55,15 @@
     historyEmpty: $("history-empty"),
     busy: $("busy"),
     busyText: $("busy-text"),
+    diagPanel: $("diagnosis-panel"),
+    diagColumns: $("diag-columns"),
+    diagAddSeg: $("diag-add-seg"),
+    diagSegments: $("diag-segments"),
+    diagRun: $("diag-run"),
+    diagSummary: $("diag-summary"),
+    diagError: $("diag-error"),
+    diagResult: $("diag-result"),
+    diagFrameHint: $("diag-frame-hint"),
   };
 
   const state = {
@@ -70,6 +79,15 @@
     // Behind the scenes: the last shown state is kept while a request is in
     // flight, so a failed operation leaves the subtitles and progress intact.
     peekLive: false,
+    // Column/character mismatch diagnosis.  A finished diagnosis keeps the
+    // frame numbers and subtitles it was computed with; once frames advance or
+    // the inputs change, it is marked stale rather than overwritten by a late
+    // response.
+    diagSeq: 0,
+    diagInFlight: false,
+    diagResult: null,
+    diagStale: false,
+    diagStaleReason: "",
   };
 
   // ---------------------------------------------------------------- helpers
@@ -175,8 +193,12 @@
     if (!payload || typeof payload.revision !== "number") return false;
     if (payload.session_id !== state.sessionId) return false;
     if (!force && payload.revision < state.revision) return false;
+    const advanced = payload.revision > state.revision && state.revision >= 0;
     state.revision = payload.revision;
     state.snapshot = payload;
+    // Frames moved (advance / confirm / undo all bump revision): any diagnosis
+    // computed at an older boundary must be labelled with its original frames.
+    if (advanced && state.diagResult) markDiagnosisStale("推进帧或改动片段后帧边界已变化");
     render();
     return true;
   }
@@ -193,6 +215,11 @@
     state.snapshot = null;
     state.loadedSample = sampleName;
     state.peekLive = true;
+    state.diagSeq += 1;
+    state.diagInFlight = false;
+    state.diagResult = null;
+    state.diagStale = false;
+    state.diagStaleReason = "";
     applyState(payload, { force: true });
     if (state.snapshot) {
       els.peekFrame.value = "0";
@@ -200,6 +227,7 @@
       els.peekFrameOut.textContent = `0 / ${state.snapshot.frame_count}`;
       els.peekNote.textContent = "显示当前帧";
     }
+    initDiagnosisPanel();
     updateButtons();
     updateStatusFromSnapshot();
   }
@@ -527,6 +555,359 @@
     updateStatusFromSnapshot();
   }
 
+  // ------------------------------------------------------------- diagnosis
+
+  const DIAG_MAX_SEG = 4;
+  const DIAG_MAX_SEG_FRAMES = 64;
+
+  function markDiagnosisStale(reason) {
+    if (!state.diagResult || state.diagStale) return;
+    state.diagStale = true;
+    state.diagStaleReason = reason;
+    renderDiagnosis();
+  }
+
+  function initDiagnosisPanel() {
+    const snap = state.snapshot;
+    els.diagColumns.innerHTML = "";
+    els.diagSegments.innerHTML = "";
+    els.diagError.hidden = true;
+    els.diagError.textContent = "";
+    els.diagResult.innerHTML = "";
+    els.diagSummary.textContent = "";
+    if (!snap) return;
+    const vocab = snap.vocab || [];
+    // Column 0 is blank and never selectable.
+    vocab.forEach((token, index) => {
+      if (index === 0) return;
+      const label = document.createElement("label");
+      label.className = "diag-col";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.value = String(index);
+      box.addEventListener("change", () => {
+        label.classList.toggle("checked", box.checked);
+        markDiagnosisStale("待核对列已修改");
+      });
+      const char = document.createElement("span");
+      char.textContent = token;
+      const idx = document.createElement("span");
+      idx.className = "col-idx";
+      idx.textContent = `#${index} 列`;
+      label.append(box, char, idx);
+      els.diagColumns.appendChild(label);
+    });
+    addDiagnosisSegment();
+    renderDiagnosis();
+  }
+
+  function addDiagnosisSegment() {
+    const snap = state.snapshot;
+    if (!snap) return;
+    if (els.diagSegments.children.length >= DIAG_MAX_SEG) {
+      showDiagnosisError(`参考片段最多 ${DIAG_MAX_SEG} 段`);
+      return;
+    }
+    const row = document.createElement("div");
+    row.className = "diag-seg";
+
+    const startField = document.createElement("label");
+    startField.className = "mini";
+    startField.append("起始帧");
+    const startInput = document.createElement("input");
+    startInput.type = "number";
+    startInput.min = "0";
+    startInput.value = "0";
+    startField.appendChild(startInput);
+
+    const endField = document.createElement("label");
+    endField.className = "mini";
+    endField.append("结束帧（不含）");
+    const endInput = document.createElement("input");
+    endInput.type = "number";
+    endInput.min = "1";
+    endInput.value = String(Math.min(DIAG_MAX_SEG_FRAMES, snap.next_frame || 1));
+    endField.appendChild(endInput);
+
+    const subField = document.createElement("label");
+    subField.className = "mini";
+    subField.append("参考字幕");
+    const subInput = document.createElement("input");
+    subInput.type = "text";
+    subInput.autocomplete = "off";
+    subInput.spellcheck = false;
+    subInput.placeholder = "例如：啊";
+    subField.appendChild(subInput);
+
+    const meta = document.createElement("div");
+    meta.className = "seg-meta";
+
+    const removeField = document.createElement("label");
+    removeField.className = "mini";
+    removeField.append(" ");
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "ghost seg-remove";
+    removeBtn.textContent = "删除";
+    removeBtn.addEventListener("click", () => {
+      if (els.diagSegments.children.length <= 1) {
+        showDiagnosisError("至少保留 1 个参考片段");
+        return;
+      }
+      row.remove();
+      markDiagnosisStale("参考片段已修改");
+    });
+    removeField.appendChild(removeBtn);
+
+    [startInput, endInput, subInput].forEach((input) => {
+      input.addEventListener("input", () => {
+        updateSegmentMeta(row);
+        markDiagnosisStale("参考片段已修改");
+      });
+    });
+
+    row.append(startField, endField, subField, removeField, meta);
+    row.dataset.metaAttached = "1";
+    els.diagSegments.appendChild(row);
+    updateSegmentMeta(row);
+  }
+
+  function updateSegmentMeta(row) {
+    const inputs = row.querySelectorAll("input");
+    const start = Number(inputs[0].value);
+    const end = Number(inputs[1].value);
+    const meta = row.querySelector(".seg-meta");
+    const length = Number.isFinite(start) && Number.isFinite(end) ? end - start : NaN;
+    if (Number.isFinite(length) && length > 0) {
+      meta.textContent = `${length} 帧${length > DIAG_MAX_SEG_FRAMES ? "（超过 64 帧上限）" : ""}`;
+      meta.style.color = length > DIAG_MAX_SEG_FRAMES ? "var(--danger)" : "";
+    } else {
+      meta.textContent = "结束帧需大于起始帧";
+      meta.style.color = "var(--danger)";
+    }
+  }
+
+  function showDiagnosisError(message) {
+    if (!message) { els.diagError.hidden = true; els.diagError.textContent = ""; return; }
+    els.diagError.hidden = false;
+    els.diagError.textContent = message;
+  }
+
+  function readDiagnosisInputs() {
+    const columns = [...els.diagColumns.querySelectorAll("input:checked")]
+      .map((box) => Number(box.value));
+    const segments = [...els.diagSegments.children].map((row) => {
+      const inputs = row.querySelectorAll("input");
+      return {
+        start: Number(inputs[0].value),
+        end: Number(inputs[1].value),
+        subtitle: inputs[2].value.trim(),
+      };
+    });
+    return { columns, segments };
+  }
+
+  function diagnosisSignature(inputs) {
+    return JSON.stringify({
+      columns: inputs.columns,
+      segments: inputs.segments.map((s) => [s.start, s.end, s.subtitle]),
+    });
+  }
+
+  async function runDiagnosis() {
+    if (!state.sessionId || !state.snapshot) return;
+    showDiagnosisError("");
+    const sessionId = state.sessionId;
+    const generation = state.generation;
+    const seq = state.diagSeq + 1;
+    state.diagSeq = seq;
+    const { columns, segments } = readDiagnosisInputs();
+    const requestInputs = { columns, segments };
+    const requestSignature = diagnosisSignature(requestInputs);
+    state.diagInFlight = true;
+    els.diagRun.disabled = true;
+    els.diagSummary.textContent = "诊断计算中…";
+
+    try {
+      const payload = await api("/api/diagnose", {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId, columns, segments }),
+      });
+      // A replaced session or a newer diagnosis request makes this late reply
+      // harmless: it must never overwrite the result currently on screen.
+      if (generation !== state.generation || sessionId !== state.sessionId || seq !== state.diagSeq) {
+        return;
+      }
+      const inputsChanged = diagnosisSignature(readDiagnosisInputs()) !== requestSignature;
+      state.diagInFlight = false;
+      state.diagResult = { ...payload, inputs: requestInputs };
+      state.diagStale = payload.revision !== state.revision || inputsChanged;
+      state.diagStaleReason = inputsChanged
+        ? "诊断在途时片段或待核对列已修改"
+        : "诊断返回前帧边界已变化";
+      renderDiagnosis();
+    } catch (error) {
+      if (generation !== state.generation || sessionId !== state.sessionId || seq !== state.diagSeq) {
+        return;
+      }
+      state.diagInFlight = false;
+      els.diagRun.disabled = false;
+      els.diagSummary.textContent = "";
+      showDiagnosisError(`诊断失败：${error.message}（解码、确认与撤销状态均未改动）`);
+    }
+  }
+
+  function renderDiagnosis() {
+    const snap = state.snapshot;
+    if (!snap) return;
+    els.diagFrameHint.textContent =
+      `已推进到第 ${snap.next_frame} / ${snap.frame_count} 帧边界；诊断只读，不影响解码、确认与撤销。`;
+    els.diagRun.disabled = state.diagInFlight || !state.sessionId;
+    const result = state.diagResult;
+    if (!result) {
+      els.diagResult.innerHTML = "";
+      if (!state.diagInFlight) els.diagSummary.textContent = "";
+      return;
+    }
+
+    const vocab = snap.vocab || [];
+    els.diagResult.innerHTML = "";
+
+    const verdict = document.createElement("div");
+    verdict.className = "diag-verdict";
+    const title = document.createElement("div");
+    title.className = "v-title";
+    const body = document.createElement("div");
+    body.className = "v-body";
+
+    if (!result.any_reachable) {
+      verdict.classList.add("none");
+      title.textContent = "所有候选映射均不可达（存在零概率路径）";
+      body.textContent = "每个双射都至少有一段字幕的精确 CTC 路径概率为 0，请检查字幕或帧区间。";
+    } else if (result.unique_optimal) {
+      verdict.classList.add("unique");
+      const winner = result.mappings.find((m) => m.optimal);
+      const assignment = winner.assignment
+        .map((a) => `${a.char} → 第 ${a.column} 列`)
+        .join("，");
+      title.textContent = `唯一最优映射：${assignment}`;
+      body.textContent =
+        `总分（各段对数概率之和）= ${fmt(result.best_logp)}；其余映射分数严格更低。`;
+    } else {
+      verdict.classList.add("tied");
+      title.textContent = `存在 ${result.optimal_count} 个同分最优映射，无法断言唯一`;
+      const tied = result.mappings.filter((m) => m.optimal)
+        .map((m) => m.assignment.map((a) => `${a.char}→列${a.column}`).join(" "))
+        .join("；");
+      body.textContent = `最优总分 ${fmt(result.best_logp)}。同分映射：${tied}`;
+    }
+    verdict.append(title, body);
+
+    if (state.diagStale) {
+      const banner = document.createElement("span");
+      banner.className = "stale-banner";
+      banner.textContent =
+        `已过期（${state.diagStaleReason}）。以下结果基于诊断时的帧边界 ` +
+        `revision=${result.revision}（当前 revision=${state.revision}），` +
+        "原帧号与字幕保留在表中；重新运行诊断以获得新结果。";
+      verdict.appendChild(banner);
+    }
+    els.diagResult.appendChild(verdict);
+
+    // Mapping table.
+    const table = document.createElement("table");
+    table.className = "diag-table";
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    ["排名", "映射（单字 → 概率列）", "总分 log P", "各段分数", "结论"].forEach((text) => {
+      const th = document.createElement("th");
+      th.textContent = text;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    result.mappings.forEach((mapping, index) => {
+      const tr = document.createElement("tr");
+      if (mapping.optimal) tr.className = "opt";
+      if (!mapping.reachable) tr.classList.add("unreach");
+
+      const rank = document.createElement("td");
+      rank.textContent = mapping.optimal
+        ? `${index + 1}（最优）`
+        : mapping.reachable ? String(index + 1) : "—";
+
+      const assignTd = document.createElement("td");
+      assignTd.className = "diag-assign";
+      mapping.assignment.forEach((a, i) => {
+        if (i > 0) assignTd.appendChild(document.createElement("br"));
+        const charSpan = document.createElement("span");
+        charSpan.style.color = "var(--accent)";
+        charSpan.textContent = a.char;
+        const arrow = document.createElement("span");
+        arrow.className = "arrow";
+        arrow.textContent = "→";
+        const colSpan = document.createElement("span");
+        colSpan.textContent = `列 ${a.column}（${vocab[a.column] || ""}）`;
+        assignTd.append(charSpan, arrow, colSpan);
+      });
+
+      const totalTd = document.createElement("td");
+      totalTd.className = "num";
+      totalTd.textContent = mapping.reachable ? fmt(mapping.total_logp) : "不可达";
+
+      const segTd = document.createElement("td");
+      segTd.className = "diag-seg-scores";
+      mapping.segments.forEach((s, i) => {
+        if (i > 0) segTd.appendChild(document.createElement("br"));
+        const line = document.createElement("span");
+        line.textContent =
+          `帧 ${s.start}–${s.end - 1}「${s.subtitle}」: ` +
+          (s.reachable ? fmt(s.logp) : "");
+        if (!s.reachable) {
+          const zero = document.createElement("span");
+          zero.className = "zero";
+          zero.textContent = "零概率，不可达";
+          line.appendChild(zero);
+        }
+        segTd.appendChild(line);
+      });
+
+      const badgeTd = document.createElement("td");
+      const badge = document.createElement("span");
+      badge.className = "diag-badge";
+      if (mapping.optimal) {
+        badge.classList.add(result.unique_optimal ? "opt" : "tied");
+        badge.textContent = result.unique_optimal ? "唯一最优" : "同分最优";
+      } else if (!mapping.reachable) {
+        badge.classList.add("bad");
+        badge.textContent = "不可达";
+      } else {
+        badge.textContent = "次优";
+      }
+      badgeTd.appendChild(badge);
+
+      tr.append(rank, assignTd, totalTd, segTd, badgeTd);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    els.diagResult.appendChild(table);
+
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.style.marginTop = "10px";
+    note.textContent =
+      `共枚举 ${result.mappings.length} 个双射；blank（第 0 列）与未选列保持不变。` +
+      "分数为该字幕全部 CTC 路径的精确前向概率，未做归一化。";
+    els.diagResult.appendChild(note);
+
+    els.diagSummary.textContent = state.diagInFlight
+      ? "诊断计算中…"
+      : `已列出 ${result.mappings.length} 个映射，其中 ${result.optimal_count} 个最优。`;
+    els.diagRun.disabled = state.diagInFlight;
+  }
+
   // ------------------------------------------------------------------- wiring
 
   els.beamWidth.addEventListener("input", () => {
@@ -637,6 +1018,9 @@
     els.peekFrameOut.textContent = `${frame} / ${els.peekFrame.max}`;
     peek(frame);
   });
+
+  els.diagAddSeg.addEventListener("click", addDiagnosisSegment);
+  els.diagRun.addEventListener("click", runDiagnosis);
 
   async function loadSamples() {
     try {

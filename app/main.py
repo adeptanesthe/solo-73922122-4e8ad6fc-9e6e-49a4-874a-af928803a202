@@ -28,6 +28,8 @@ from pydantic import BaseModel
 
 from .decoder import DecodeError
 from . import state as state_module
+from . import diagnosis as diagnosis_module
+from .diagnosis import Segment
 from .state import SessionError, SessionManager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -66,6 +68,18 @@ class ConfirmBody(BaseModel):
 
 class UndoBody(BaseModel):
     session_id: str
+
+
+class DiagnosisSegmentBody(BaseModel):
+    start: int
+    end: int
+    subtitle: str
+
+
+class DiagnosisBody(BaseModel):
+    session_id: str
+    columns: list[int]
+    segments: list[DiagnosisSegmentBody]
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +278,37 @@ async def confirm_endpoint(body: ConfirmBody) -> dict:
 async def undo_endpoint(body: UndoBody) -> dict:
     session = _session_or_404(body.session_id)
     return await _run_op(session, state_module.undo)
+
+
+# ---------------------------------------------------------------------------
+# Column/character mismatch diagnosis (read-only)
+
+
+@app.post("/api/diagnose")
+async def diagnose_endpoint(body: DiagnosisBody) -> dict:
+    """Score every column↔character bijection on the reference subtitles.
+
+    Read-only: it runs on the session's ordered worker but never modifies
+    beams, confirmations, undo history or revision.  The response echoes the
+    session revision at compute time, which lets the UI flag the result as
+    stale after a later advance / confirm / undo.
+    """
+    session = _session_or_404(body.session_id)
+    segments = [
+        Segment(start=item.start, end=item.end, subtitle=item.subtitle)
+        for item in body.segments
+    ]
+
+    def run(sess):
+        return diagnosis_module.run_diagnosis(sess, body.columns, segments)
+
+    future = manager.submit(session, run)
+    try:
+        return await asyncio.wrap_future(future)
+    except SessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DecodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

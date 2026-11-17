@@ -146,6 +146,39 @@
       <ol class="history-list" id="history-list"></ol>
       <p class="empty" id="history-empty">还没有确认过前缀。</p>
     </div>
+
+    <div class="panel diagnosis" id="diagnosis-panel">
+      <div class="panel-head">
+        <h2>5. 词表列 / 单字错配诊断</h2>
+        <span class="hint" id="diag-frame-hint">仅使用已推进帧，只读，不影响解码、确认与撤销。</span>
+      </div>
+      <p class="hint diag-intro">
+        选 2～5 个怀疑错位的概率列（blank 第 0 列与其余列保持不变），为 1～4 段互不重叠、
+        每段不超过 64 帧的已推进帧区间填写校订字幕；系统枚举所选列与单字的全部双射，
+        按 CTC 精确路径概率（各段对数分数之和）选出最优映射。零概率路径不可达；
+        同分最优会全部列出，无法区分时不会断言唯一。
+      </p>
+
+      <div class="diag-block">
+        <span class="diag-label">待核对单字（列）</span>
+        <div class="diag-columns" id="diag-columns"></div>
+      </div>
+
+      <div class="diag-block">
+        <div class="diag-label-row">
+          <span class="diag-label">参考字幕片段（帧区间为左闭右开，帧号 0 起）</span>
+          <button class="ghost sample" id="diag-add-seg" type="button">+ 添加片段</button>
+        </div>
+        <div id="diag-segments"></div>
+      </div>
+
+      <div class="row">
+        <button class="primary" id="diag-run" type="button">运行诊断</button>
+        <span class="hint" id="diag-summary"></span>
+      </div>
+      <p class="error" id="diag-error" hidden></p>
+      <div id="diag-result"></div>
+    </div>
   </section>
 </main>
 

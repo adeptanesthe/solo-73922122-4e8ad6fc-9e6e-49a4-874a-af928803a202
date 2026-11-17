@@ -129,7 +129,83 @@ const bodyText = $("beam-body").textContent;
 check("零概率样例无 NaN", !bodyText.includes("NaN"), bodyText.slice(0, 120));
 check("零概率样例显示 -∞", bodyText.includes("-∞") || $("frame-probs").textContent.includes("0.000"));
 
-// 10. no uncaught UI errors
+// 10. column/character mismatch diagnosis panel
+const diagPanel = $("diagnosis-panel");
+check("诊断面板已渲染", !!diagPanel && !diagPanel.hidden);
+const colBoxes = [...$("diag-columns").querySelectorAll("input[type=checkbox]")];
+check("诊断列复选框为非 blank 列", colBoxes.length === 3 && !colBoxes.some((b) => b.value === "0"),
+  `${colBoxes.length} columns`);
+// select two columns (x=#1, y=#2); z stays fixed
+colBoxes.find((b) => b.value === "1").click();
+colBoxes.find((b) => b.value === "2").click();
+// fill one segment covering the advanced frames with a reachable subtitle
+const segRows = [...$("diag-segments").children];
+const segInputs = segRows[0].querySelectorAll("input");
+segInputs[0].value = "0";
+segInputs[0].dispatchEvent(new window.Event("input"));
+segInputs[1].value = "4";
+segInputs[1].dispatchEvent(new window.Event("input"));
+segInputs[2].value = "x";
+segInputs[2].dispatchEvent(new window.Event("input"));
+$("diag-run").click();
+await until(() => $("diag-result").children.length > 0, "diagnosis result", 20000);
+const verdictText = $("diag-result").textContent;
+check("诊断给出映射表", $("diag-result").querySelectorAll(".diag-table tbody tr").length === 2,
+  `${$("diag-result").querySelectorAll(".diag-table tbody tr").length} rows`);
+check("诊断报告最优结论", verdictText.includes("最优映射"), verdictText.slice(0, 80));
+check("诊断表保留原帧号与字幕", verdictText.includes("帧 0–3") && verdictText.includes("「x」"));
+
+// 11. advancing frames marks the previous diagnosis stale instead of overwriting
+$("step-btn").click();
+await sleep(600);
+check("推进后旧诊断标记过期", $("diag-result").textContent.includes("已过期"),
+  $("diag-result").querySelector(".stale-banner")?.textContent.slice(0, 60) || "no banner");
+
+// 12. invalid diagnosis (overlapping segments) surfaces an error and changes nothing
+$("diag-add-seg").click();
+const rows2 = [...$("diag-segments").children];
+check("可添加第二个片段", rows2.length === 2);
+const secondInputs = rows2[1].querySelectorAll("input");
+secondInputs[0].value = "2";
+secondInputs[0].dispatchEvent(new window.Event("input"));
+secondInputs[1].value = "6";
+secondInputs[1].dispatchEvent(new window.Event("input"));
+secondInputs[2].value = "y";
+secondInputs[2].dispatchEvent(new window.Event("input"));
+const progressBeforeDiag = $("progress-text").textContent;
+$("diag-run").click();
+await until(() => !$("diag-error").hidden, "diagnosis error");
+check("重叠片段报错", $("diag-error").textContent.includes("重叠"), $("diag-error").textContent);
+check("诊断失败不改动进度", $("progress-text").textContent === progressBeforeDiag);
+
+// 12b. symmetric columns must surface a tie verdict through the real panel,
+// never a unique claim.  A bundled sample provides the symmetric data.
+await until(() => [...$("sample-buttons").children].some((b) => b.textContent.includes("sample_tie")),
+  "tie sample button");
+const tieBtn = [...$("sample-buttons").children].find((b) => b.textContent.includes("sample_tie"));
+tieBtn.click();
+await until(() => $("progress-text").textContent.startsWith("0 / 3"), "tie sample loaded");
+$("step-btn").click();
+await until(() => $("progress-text").textContent.startsWith("3 / 3"), "tie sample advanced");
+const tieBoxes = [...$("diag-columns").querySelectorAll("input[type=checkbox]")];
+tieBoxes.find((b) => b.value === "1").click();
+tieBoxes.find((b) => b.value === "2").click();
+const tieRows = [...$("diag-segments").children];
+const tieInputs = tieRows[0].querySelectorAll("input");
+tieInputs[0].value = "0";
+tieInputs[0].dispatchEvent(new window.Event("input"));
+tieInputs[1].value = "3";
+tieInputs[1].dispatchEvent(new window.Event("input"));
+tieInputs[2].value = "a";
+tieInputs[2].dispatchEvent(new window.Event("input"));
+$("diag-run").click();
+await until(() => $("diag-result").textContent.includes("同分最优映射"), "tie verdict");
+const tieVerdict = $("diag-result").querySelector(".diag-verdict");
+check("并列时显示同分最优而非唯一", tieVerdict.classList.contains("tied") && !tieVerdict.classList.contains("unique"),
+  tieVerdict.querySelector(".v-title").textContent);
+check("并列映射行数为 2", $("diag-result").querySelectorAll("tr.opt").length === 2);
+
+// 13. no uncaught UI errors
 check("无未捕获脚本错误", errors.length === 0, errors.join(" | ").slice(0, 200));
 
 const failed = results.filter((r) => !r.ok);

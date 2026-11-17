@@ -16,6 +16,9 @@ interesting CTC situations the workbench cares about:
 ``sample_sparse_zero.json``
     hard zeros (``log 0 = -inf``) for some labels, including a frame whose blank
     probability is exactly 0, so the UI can show ``-∞`` without NaNs.
+``sample_tie.json``
+    two identical probability columns, so every column/character bijection ties
+    and the mismatch diagnosis must report all optimal mappings together.
 """
 
 from __future__ import annotations
@@ -119,12 +122,31 @@ def sparse_zero_sample():
     }
 
 
+def tie_sample():
+    # Columns 1 and 2 are identical on every frame, so swapping them can never
+    # change a CTC score: the mismatch diagnosis must report a two-way tie
+    # instead of asserting a unique column/character mapping.
+    vocab = ["<blank>", "a", "b"]
+    rows = [
+        [0.2, 0.4, 0.4],
+        [0.2, 0.4, 0.4],
+        [0.6, 0.2, 0.2],
+    ]
+    return {
+        "name": "对称列同分",
+        "description": "两个概率列完全相同，任何双射都同分；诊断必须并列报告而不得断言唯一。",
+        "vocab": vocab,
+        "frames": rows,
+    }
+
+
 def main() -> None:
     SAMPLES.mkdir(parents=True, exist_ok=True)
     for name, payload in (
         ("sample_repeat.json", repeat_sample()),
         ("sample_blank_heavy.json", blank_heavy_sample()),
         ("sample_sparse_zero.json", sparse_zero_sample()),
+        ("sample_tie.json", tie_sample()),
     ):
         path = SAMPLES / name
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
